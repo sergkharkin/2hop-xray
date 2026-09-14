@@ -459,6 +459,291 @@ local function update_geo(key)
     return sz, ((rc == 0 or rc == true) and xray_running()) and 'restarted' or 'restart_failed'
 end
 
+-- ── Управляемые списки доменов ───────────────────────────────────────────────
+--
+-- Панель НЕ создаёт собственных правил. Домены живут в двух УЖЕ СУЩЕСТВУЮЩИХ
+-- правилах routing.rules, помеченных ruleTag:
+--   hop-list-foreign — «заграничный» список (telegram/claude/openai/linkedin…)
+--   hop-list-ru      — «российский» список (asna/yandex/vk/банки…)
+--
+-- Правится ТОЛЬКО поле domain этих правил. outboundTag, позиция и всё остальное
+-- принадлежат конфигу: куда ведёт лейн — решает сам конфиг. В прямом режиме
+-- foreign → proxy, ru → direct (или entry-hop); в обратном (роутер за границей,
+-- выход в РФ) foreign → direct, ru → proxy. Поэтому один и тот же список
+-- безопасно раскатывать на весь флот.
+--
+-- Если меток ещё нет, они проставляются автоматически по якорным доменам
+-- (ANCHORS), а устаревшие правила hop-ui-proxy / hop-ui-direct (панель ставила
+-- их первыми и они перекрывали нижние списки) вливаются в свой лейн и удаляются.
+
+local LANES      = { 'foreign', 'ru' }
+local RULE_TAG   = { foreign = 'hop-list-foreign', ru = 'hop-list-ru' }
+local LEGACY_TAG = { ['hop-ui-proxy'] = 'foreign', ['hop-ui-direct'] = 'ru' }
+local LANE_TITLE = { foreign = 'заграничный', ru = 'российский' }
+local ANCHORS    = {
+    foreign = { 'telegram.org', 't.me', 'claude.ai', 'openai.com', 'chatgpt.com', 'signal.org' },
+    ru      = { 'asna.pro', 'yandex.ru', 'ya.ru', 'vk.com', 'gosuslugi.ru', 'ozon.ru' },
+}
+local ANCHOR_MIN = 2      -- столько якорей нужно, чтобы опознать список
+
+-- Префиксы Xray, которые пропускаем как есть; всё прочее получает domain:
+local KNOWN_PREFIX = {
+    ['domain:'] = true, ['full:']    = true, ['regexp:'] = true,
+    ['keyword:'] = true, ['geosite:'] = true, ['ext:']    = true,
+}
+
+-- Строка → элемент domain-списка. nil = строку пропустить (пусто/комментарий).
+local function normalize_domain(line)
+    local s = line:match('^%s*(.-)%s*$')
+    if s == '' or s:sub(1, 1) == '#' then return nil end
+    s = s:gsub('^%a+://', ''):gsub('/.*$', '')          -- вставили URL — берём хост
+    local pfx = s:match('^(%a+:)')
+    if pfx and KNOWN_PREFIX[pfx:lower()] then
+        local rest = s:sub(#pfx + 1)
+        if rest == '' then error('Пустое значение после ' .. pfx, 0) end
+        return pfx:lower() .. rest
+    end
+    if s:find('%.') and s:match('^[%w%*%._%-]+$') then
+        return 'domain:' .. s:lower()
+    end
+    error('Не похоже на домен: ' .. s, 0)
+end
+
+-- Текст из textarea → массив доменов (нормализованных, без дублей, в порядке ввода)
+local function parse_list(text)
+    local out, seen = {}, {}
+    for line in (text or ''):gmatch('[^\r\n]+') do
+        local d = normalize_domain(line)
+        if d and not seen[d] then seen[d] = true; out[#out + 1] = d end
+    end
+    return out
+end
+
+-- 'domain:vk.com' → 'vk.com' (для сравнения с якорями)
+local function bare(d)
+    return (tostring(d):gsub('^%a+:', ''))
+end
+
+-- Найти правила-лейны. Возвращает: map lane→rule, список legacy-правил,
+-- migrated (true, если пришлось проставить метки).
+local function locate_lanes(cfg)
+    local rules = ((cfg.routing or {}).rules) or {}
+    local found, legacy, migrated = {}, {}, false
+
+    for _, r in ipairs(rules) do
+        if type(r) == 'table' and type(r.ruleTag) == 'string' then
+            for _, lane in ipairs(LANES) do
+                if r.ruleTag == RULE_TAG[lane] and type(r.domain) == 'table' then
+                    found[lane] = r
+                end
+            end
+            if LEGACY_TAG[r.ruleTag] and type(r.domain) == 'table' then
+                legacy[#legacy + 1] = r
+            end
+        end
+    end
+
+    for _, lane in ipairs(LANES) do
+        if not found[lane] then
+            local best, best_hits = nil, 0
+            for _, r in ipairs(rules) do
+                if type(r) == 'table' and type(r.domain) == 'table' and r.ruleTag == nil then
+                    local set = {}
+                    for _, d in ipairs(r.domain) do set[bare(d)] = true end
+                    local hits = 0
+                    for _, a in ipairs(ANCHORS[lane]) do if set[a] then hits = hits + 1 end end
+                    if hits > best_hits then best, best_hits = r, hits end
+                end
+            end
+            if best and best_hits >= ANCHOR_MIN then
+                best.ruleTag = RULE_TAG[lane]
+                found[lane]  = best
+                migrated     = true
+            end
+        end
+    end
+
+    return found, legacy, migrated
+end
+
+-- Влить устаревшие hop-ui-* правила в свои лейны и удалить их.
+-- Возвращает число перенесённых доменов и число удалённых правил.
+local function fold_legacy(cfg, found, legacy)
+    if #legacy == 0 then return 0, 0 end
+    local moved, killed = 0, 0
+    local drop = {}
+    for _, r in ipairs(legacy) do
+        local lane = LEGACY_TAG[r.ruleTag]
+        local dst  = found[lane]
+        if dst then
+            local seen = {}
+            for _, d in ipairs(dst.domain) do seen[d] = true end
+            for _, d in ipairs(r.domain) do
+                if not seen[d] then seen[d] = true; dst.domain[#dst.domain + 1] = d; moved = moved + 1 end
+            end
+            drop[r] = true; killed = killed + 1
+        end
+    end
+    if killed > 0 then
+        local kept = {}
+        for _, r in ipairs(cfg.routing.rules) do
+            if not drop[r] then kept[#kept + 1] = r end
+        end
+        cfg.routing.rules = kept
+    end
+    return moved, killed
+end
+
+-- Текущий список лейна
+local function get_lane(cfg, lane)
+    local found = locate_lanes(cfg)
+    local out = {}
+    if found[lane] then
+        for _, d in ipairs(found[lane].domain) do out[#out + 1] = d end
+    end
+    return out
+end
+
+-- Сколько доменов лейна перекрыто правилом, стоящим ВЫШЕ (first-match-wins).
+local function count_shadowed(cfg, found, lane)
+    local target = found[lane]
+    if not target then return 0 end
+    local mine = {}
+    for _, d in ipairs(target.domain) do mine[d] = true end
+    local n = 0
+    for _, r in ipairs(cfg.routing.rules) do
+        if r == target then break end
+        if type(r) == 'table' and type(r.domain) == 'table' then
+            for _, d in ipairs(r.domain) do if mine[d] then n = n + 1 end end
+        end
+    end
+    return n
+end
+
+-- Применить списки к одному файлу. mode: 'merge' | 'replace'.
+-- Возвращает: status ('ok'|'nochange'|'nolist'|'broken'|'fail'),
+--             добавлено, перенесено из legacy, перекрыто сверху, вывод xray
+local function write_lists(path, lists, mode, bakdir)
+    local ok_read, cfg = pcall(read_json, path)
+    if not ok_read then return 'fail', 0, 0, 0, tostring(cfg) end
+
+    local found, legacy, migrated = locate_lanes(cfg)
+    local moved, killed = fold_legacy(cfg, found, legacy)
+    local changed = migrated or killed > 0
+
+    for _, lane in ipairs(LANES) do
+        if #(lists[lane] or {}) > 0 and not found[lane] then
+            return 'nolist', 0, 0, 0, 'нет правила ' .. RULE_TAG[lane] ..
+                   ' и не опознан ' .. LANE_TITLE[lane] .. ' список'
+        end
+    end
+
+    local added, shadowed = 0, 0
+    for _, lane in ipairs(LANES) do
+        local rule = found[lane]
+        if rule then
+            local cur = rule.domain
+            local new
+            if mode == 'replace' then
+                new = lists[lane]
+            else
+                new = {}
+                local seen = {}
+                for _, d in ipairs(cur) do
+                    if not seen[d] then seen[d] = true; new[#new + 1] = d end
+                end
+                for _, d in ipairs(lists[lane] or {}) do
+                    if not seen[d] then
+                        seen[d] = true; new[#new + 1] = d; added = added + 1
+                    end
+                end
+            end
+            if #new ~= #cur then changed = true
+            else
+                for i = 1, #new do if new[i] ~= cur[i] then changed = true; break end end
+            end
+            rule.domain = new
+        end
+    end
+
+    for _, lane in ipairs(LANES) do
+        shadowed = shadowed + count_shadowed(cfg, found, lane)
+    end
+
+    if not changed then return 'nochange', 0, 0, shadowed, '' end
+
+    local tmp = CONFIG_DIR .. '/.config-validate.json'
+    local f, ferr = io.open(tmp, 'w')
+    if not f then return 'fail', 0, 0, 0, tostring(ferr) end
+    f:write(pretty_json(cfg)); f:write('\n'); f:close()
+
+    local valid, out = xray_validate(tmp)
+    if not valid then
+        -- был ли файл валиден ДО нас? если нет — это не наша поломка
+        local was_ok = xray_validate(path)
+        os.remove(tmp)
+        return (was_ok and 'fail' or 'broken'), 0, 0, 0, out
+    end
+
+    if path == CONFIG_FILE then
+        backup_config()                       -- config.json.TS — виден в «Восстановить»
+    elseif bakdir then
+        os.execute('mkdir -p ' .. bakdir .. ' && cp ' .. path .. ' ' .. bakdir .. '/ 2>/dev/null')
+    end
+    os.rename(tmp, path)
+    return 'ok', added, moved, shadowed, ''
+end
+
+-- Раскатать списки по выбранным целям. targets: {config=bool, templates=bool}
+-- Возвращает таблицу-отчёт.
+local function apply_lists(lists, mode, targets)
+    local files = {}
+    if targets.config then files[#files + 1] = CONFIG_FILE end
+    if targets.templates then
+        for _, name in ipairs(list_templates()) do
+            files[#files + 1] = CONFIG_DIR .. '/config-' .. name .. '.json.bak'
+        end
+    end
+    if #files == 0 then error('Не выбрано ни одной цели', 0) end
+
+    -- каталог создаётся лениво, при первом реальном бэкапе шаблона
+    local bakdir = CONFIG_DIR .. '/backups/' .. os.date('%Y%m%d_%H%M%S') .. '-lists'
+
+    local rep = { ok = {}, nochange = {}, nolist = {}, broken = {}, fail = {},
+                  bakdir = bakdir, added = 0, moved = 0, shadowed = 0, restarted = nil }
+    local config_changed = false
+
+    for _, path in ipairs(files) do
+        local name = path:match('([^/]+)$')
+        local st, added, moved, shadowed, out = write_lists(path, lists, mode, bakdir)
+        rep.added    = rep.added + added
+        rep.moved    = rep.moved + moved
+        rep.shadowed = rep.shadowed + shadowed
+        if st == 'ok' then
+            rep.ok[#rep.ok + 1] = name
+            if path == CONFIG_FILE then config_changed = true end
+        elseif st == 'nochange' then
+            rep.nochange[#rep.nochange + 1] = name
+        elseif st == 'nolist' then
+            rep.nolist[#rep.nolist + 1] = name
+        elseif st == 'broken' then
+            rep.broken[#rep.broken + 1] = name
+        else
+            rep.fail[#rep.fail + 1] = name .. ': ' .. (out:match('Main: (.+)') or out:sub(1, 200))
+        end
+    end
+
+    -- рестарт только если поменялся активный конфиг и xray работал
+    if config_changed then
+        if xray_running() then
+            rep.restarted = (os.execute('/etc/init.d/xray restart >/dev/null 2>&1') == 0)
+        else
+            rep.restarted = 'stopped'
+        end
+    end
+    return rep
+end
+
 -- ── Apply (шаблон + entry-hop) ────────────────────────────────────────────────
 
 local function apply(template_name, ep)
@@ -753,6 +1038,53 @@ local function render(message, sel_tpl, vless_pre, sel_bak, sel_restore)
     end
     if restore_opts == '' then restore_opts = '<option value="">— нет бэкапов —</option>' end
 
+    -- Управляемые списки доменов (карточка «Списки доменов»)
+    local lst  = { foreign = {}, ru = {} }
+    local lane_to = { foreign = '—', ru = '—' }
+    if ok then
+        local found = locate_lanes(cfg)
+        for _, lane in ipairs(LANES) do
+            local r = found[lane]
+            if r then
+                for _, d in ipairs(r.domain) do lst[lane][#lst[lane] + 1] = d end
+                lane_to[lane] = r.outboundTag or ('balancer:' .. tostring(r.balancerTag)) or '—'
+            end
+        end
+    end
+    local n_tpl = #list_templates()
+    local lists_html = string.format([[
+<div class="card">
+  <form method="POST">
+    <input type="hidden" name="action" value="rules">
+    <div class="lbl">Списки доменов &nbsp;<span class="bak">правила <code>hop-list-foreign</code> / <code>hop-list-ru</code></span></div>
+    <div style="margin-top:12px">
+      <div class="lbl">Заграничные ресурсы <span class="bak">(%s доменов · в этом конфиге → <code>%s</code>)</span></div>
+      <textarea name="list_foreign" rows="7" placeholder="linkedin.com">%s</textarea>
+    </div>
+    <div style="margin-top:12px">
+      <div class="lbl">Российские ресурсы <span class="bak">(%s доменов · в этом конфиге → <code>%s</code>)</span></div>
+      <textarea name="list_ru" rows="7" placeholder="vkvideo.ru">%s</textarea>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:18px;flex-wrap:wrap">
+      <label><input type="radio" name="mode" value="merge" checked> добавить</label>
+      <label><input type="radio" name="mode" value="replace"> заменить целиком</label>
+    </div>
+    <div style="margin-top:8px;display:flex;gap:18px;flex-wrap:wrap">
+      <label><input type="checkbox" name="t_config" value="1" checked> config.json</label>
+      <label><input type="checkbox" name="t_templates" value="1" checked> все шаблоны (%s)</label>
+    </div>
+    <div class="bak" style="margin-top:10px">Домен на строку · <code>#</code> — комментарий · голый домен станет
+    <code>domain:</code>, префиксы <code>full: regexp: keyword: geosite: ext:</code> идут как есть.<br>
+    Домены дописываются в СУЩЕСТВУЮЩИЕ правила-списки; куда ведёт лейн (<code>proxy</code>,
+    <code>direct</code>, <code>entry-hop</code>) решает сам конфиг — панель outboundTag и порядок правил не трогает.<br>
+    Каждый файл проверяется <code>xray -test</code>, бэкапы в <code>/etc/xray/backups/</code>.</div>
+    <button type="submit">Сохранить списки</button>
+  </form>
+</div>]],
+        #lst.foreign, html(lane_to.foreign), html(table.concat(lst.foreign, '\n')),
+        #lst.ru,      html(lane_to.ru),      html(table.concat(lst.ru,      '\n')),
+        n_tpl)
+
     -- Geo-файлы: строка на каждый файл (имя · размер · кнопка)
     local gdir = asset_dir()
     local geo_rows = ''
@@ -847,6 +1179,8 @@ local function render(message, sel_tpl, vless_pre, sel_bak, sel_restore)
   </form>
 </div>
 
+%s
+
 <div class="card">
   <form method="POST">
     <input type="hidden" name="action" value="copy">
@@ -901,6 +1235,7 @@ local function render(message, sel_tpl, vless_pre, sel_bak, sel_restore)
         toggle_html,
         message or '',
         opts,
+        lists_html,
         bak_opts,
         html(gdir), geo_rows,
         restore_opts
@@ -1055,6 +1390,114 @@ if method == 'POST' then
                    html(tostring(result)):gsub('\n', '<br>'))
             flash_save(msg)
             redirect_back()
+
+        elseif action == 'rules' then
+            local mode = (data.mode or 'merge'):match('^%s*(.-)%s*$')
+            if mode ~= 'replace' then mode = 'merge' end
+            local targets = {
+                config    = (data.t_config    or '') ~= '',
+                templates = (data.t_templates or '') ~= '',
+            }
+            local as_text = (data.format or '') == 'text'
+
+            local ok, rep = pcall(function()
+                -- list_foreign/list_ru; старые имена полей поддерживаем как алиасы
+                local lists = {
+                    foreign = parse_list(data.list_foreign or data.list_proxy),
+                    ru      = parse_list(data.list_ru      or data.list_direct),
+                }
+                local seen = {}
+                for _, d in ipairs(lists.foreign) do seen[d] = true end
+                for _, d in ipairs(lists.ru) do
+                    if seen[d] then
+                        error('Домен и в заграничном, и в российском списке: ' .. d, 0)
+                    end
+                end
+                -- «Заменить целиком» правит СУЩЕСТВУЮЩИЙ большой список конфига,
+                -- поэтому частичный список стёр бы его. Требуем якорные домены.
+                if mode == 'replace' then
+                    for _, lane in ipairs(LANES) do
+                        local set = {}
+                        for _, d in ipairs(lists[lane]) do set[bare(d)] = true end
+                        local hits = 0
+                        for _, a in ipairs(ANCHORS[lane]) do if set[a] then hits = hits + 1 end end
+                        if #lists[lane] > 0 and hits < ANCHOR_MIN then
+                            error('Замена ' .. LANE_TITLE[lane] .. ' списка: прислан неполный список'
+                                .. ' (нет опорных доменов). Для точечных правок используйте «добавить».', 0)
+                        end
+                    end
+                end
+                return apply_lists(lists, mode, targets)
+            end)
+
+            if as_text then
+                io.write('Content-Type: text/plain; charset=utf-8\r\n\r\n')
+                if not ok then
+                    io.write('ERR: ' .. tostring(rep) .. '\n')
+                else
+                    io.write(string.format(
+                        'OK mode=%s changed=%d nochange=%d added=%d moved=%d shadowed=%d nolist=%d broken=%d failed=%d\n',
+                        mode, #rep.ok, #rep.nochange, rep.added, rep.moved, rep.shadowed,
+                        #rep.nolist, #rep.broken, #rep.fail))
+                    if #rep.ok > 0 then io.write('changed: ' .. table.concat(rep.ok, ' ') .. '\n') end
+                    if #rep.nolist > 0 then
+                        io.write('nolist (не опознаны списки, пропущены): '
+                            .. table.concat(rep.nolist, ' ') .. '\n')
+                    end
+                    if #rep.broken > 0 then
+                        io.write('broken (были невалидны и до правки, пропущены): '
+                            .. table.concat(rep.broken, ' ') .. '\n')
+                    end
+                    for _, e in ipairs(rep.fail) do io.write('FAIL ' .. e .. '\n') end
+                    if rep.restarted ~= nil then
+                        io.write('xray: ' .. (rep.restarted == 'stopped' and 'был остановлен, не трогали'
+                            or (rep.restarted and 'перезапущен' or 'ПЕРЕЗАПУСК НЕ УДАЛСЯ')) .. '\n')
+                    end
+                    io.write('backup: ' .. rep.bakdir .. '\n')
+                end
+            else
+                local msg
+                if not ok then
+                    msg = string.format('<div class="msg err">Ошибка: %s</div>',
+                        html(tostring(rep)):gsub('\n', '<br>'))
+                else
+                    local bits = { string.format(
+                        'Списки сохранены (%s) · изменено файлов: <b>%d</b> · без изменений: %d · +%d доменов · перенесено из старых правил: %d',
+                        mode == 'replace' and 'замена' or 'добавление',
+                        #rep.ok, #rep.nochange, rep.added, rep.moved) }
+                    if #rep.nolist > 0 then
+                        bits[#bits+1] = 'Пропущены (нет опознаваемых списков): <b>'
+                            .. html(table.concat(rep.nolist, ', ')) .. '</b>'
+                    end
+                    if rep.shadowed > 0 then
+                        bits[#bits+1] = string.format(
+                            '<b>Внимание:</b> %d домен(ов) перекрыты правилом выше — там маршрут решается раньше',
+                            rep.shadowed)
+                    end
+                    if #rep.ok > 0 then
+                        bits[#bits+1] = '<span class="bak">' .. html(table.concat(rep.ok, ', ')) .. '</span>'
+                    end
+                    if #rep.broken > 0 then
+                        bits[#bits+1] = 'Пропущены (не проходят xray -test и без наших правок): <b>'
+                            .. html(table.concat(rep.broken, ', ')) .. '</b>'
+                    end
+                    if rep.restarted == 'stopped' then
+                        bits[#bits+1] = 'xray выключен — применится при следующем запуске'
+                    elseif rep.restarted == false then
+                        bits[#bits+1] = '<b>ВНИМАНИЕ: xray не перезапустился</b>'
+                    elseif rep.restarted == true then
+                        bits[#bits+1] = 'xray перезапущен'
+                    end
+                    bits[#bits+1] = '<span class="bak">бэкап: ' .. html(rep.bakdir) .. '</span>'
+                    local cls = #rep.fail > 0 and 'err' or 'ok'
+                    for _, e in ipairs(rep.fail) do
+                        bits[#bits+1] = 'ОШИБКА ' .. html(e)
+                    end
+                    msg = '<div class="msg ' .. cls .. '">' .. table.concat(bits, '<br>') .. '</div>'
+                end
+                flash_save(msg)
+                redirect_back()
+            end
 
         elseif action == 'geo' then
             local key = (data.geo_file or ''):match('^%s*(.-)%s*$')

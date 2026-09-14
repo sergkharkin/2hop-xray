@@ -20,3 +20,8 @@ example.txt
 *.zip
 *.bak.*
 .DS_Store
+
+# Список роутеров и рабочие списки доменов (личные данные)
+routers.conf
+lists/*.txt
+!lists/*.example
