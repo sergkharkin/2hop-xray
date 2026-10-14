@@ -604,6 +604,132 @@ local function get_lane(cfg, lane)
     return out
 end
 
+-- ── Лейн bee: выход через домашний IP (outbound proxy-res) ──────────────────
+--
+-- В отличие от foreign/ru, эти правила панель создаёт и удаляет сама — но ТОЛЬКО
+-- в конфигах, где есть outbound proxy-res (шаблоны *-bee). Правил два, потому
+-- что domain и ip внутри одного правила Xray складывает через «И»:
+--   bee-list    — домены  → proxy-res
+--   bee-list-ip — IP/CIDR → proxy-res
+-- Оба ставятся вплотную перед hop-list-ru: bee важнее российского списка
+-- (домен может быть в обоих — победит bee), но ниже служебных direct-правил
+-- и заграничного списка.
+
+local BEE_OUT    = 'proxy-res'
+local BEE_TAG    = 'bee-list'
+local BEE_IP_TAG = 'bee-list-ip'
+
+local function has_outbound(cfg, tag)
+    for _, ob in ipairs(cfg.outbounds or {}) do
+        if type(ob) == 'table' and ob.tag == tag then return true end
+    end
+    return false
+end
+
+-- Строка → IP-элемент ('1.2.3.4', '10.0.0.0/8', '2a00:1450::/32', 'geoip:xx')
+-- или nil, если это не IP (тогда строку разбирает normalize_domain).
+local function normalize_ip(s)
+    local low = s:lower()
+    if low:match('^geoip:!?[%w%-]+$') then return low end
+    local ip, mask = s:match('^([%d%.]+)/(%d+)$')
+    if not ip and s:match('^[%d%.]+$') then ip = s end
+    if ip then
+        local o = { ip:match('^(%d+)%.(%d+)%.(%d+)%.(%d+)$') }
+        if #o ~= 4 then error('Не похоже на IPv4: ' .. s, 0) end
+        for _, n in ipairs(o) do
+            if tonumber(n) > 255 then error('Не похоже на IPv4: ' .. s, 0) end
+        end
+        if mask and tonumber(mask) > 32 then error('Маска больше /32: ' .. s, 0) end
+        return s
+    end
+    local v6, m6 = low:match('^([%x:]+)/?(%d*)$')
+    if v6 and v6:find(':.*:') then
+        if m6 ~= '' and tonumber(m6) > 128 then error('Маска больше /128: ' .. s, 0) end
+        return low
+    end
+    return nil
+end
+
+-- Текст из textarea → { domain = {...}, ip = {...} } без дублей, в порядке ввода
+local function parse_bee(text)
+    local out, seen = { domain = {}, ip = {} }, {}
+    for line in (text or ''):gmatch('[^\r\n]+') do
+        local s = line:match('^%s*(.-)%s*$')
+        if s ~= '' and s:sub(1, 1) ~= '#' then
+            local ip = normalize_ip(s)
+            local k, v = 'ip', ip
+            if not ip then k, v = 'domain', normalize_domain(s) end
+            if v and not seen[v] then seen[v] = true; out[k][#out[k] + 1] = v end
+        end
+    end
+    return out
+end
+
+local function get_bee(cfg)
+    local out = { domain = {}, ip = {} }
+    for _, r in ipairs(((cfg.routing or {}).rules) or {}) do
+        if type(r) == 'table' and r.ruleTag == BEE_TAG and type(r.domain) == 'table' then
+            for _, d in ipairs(r.domain) do out.domain[#out.domain + 1] = d end
+        elseif type(r) == 'table' and r.ruleTag == BEE_IP_TAG and type(r.ip) == 'table' then
+            for _, d in ipairs(r.ip) do out.ip[#out.ip + 1] = d end
+        end
+    end
+    return out
+end
+
+local function same_list(a, b)
+    if #a ~= #b then return false end
+    for i = 1, #a do if a[i] ~= b[i] then return false end end
+    return true
+end
+
+-- Применить bee-списки к cfg (mode: 'merge' | 'replace').
+-- Возвращает: 'skip' (нет proxy-res) | 'nochange' | 'ok', число новых записей.
+local function apply_bee(cfg, bee, mode)
+    if not has_outbound(cfg, BEE_OUT) then return 'skip', 0 end
+    local cur = get_bee(cfg)
+    local new, added = { domain = {}, ip = {} }, 0
+    for _, k in ipairs({ 'domain', 'ip' }) do
+        local seen, had = {}, {}
+        for _, v in ipairs(cur[k]) do had[v] = true end
+        local src = (mode == 'replace') and { bee[k] } or { cur[k], bee[k] }
+        for _, list in ipairs(src) do
+            for _, v in ipairs(list) do
+                if not seen[v] then
+                    seen[v] = true; new[k][#new[k] + 1] = v
+                    if not had[v] then added = added + 1 end
+                end
+            end
+        end
+    end
+    if same_list(new.domain, cur.domain) and same_list(new.ip, cur.ip) then
+        return 'nochange', 0
+    end
+
+    -- снять старые bee-правила и поставить новые вплотную перед hop-list-ru
+    local kept, anchor = {}, nil
+    for _, r in ipairs(cfg.routing.rules) do
+        local is_bee = type(r) == 'table' and (r.ruleTag == BEE_TAG or r.ruleTag == BEE_IP_TAG)
+        if not is_bee then
+            kept[#kept + 1] = r
+            if not anchor and type(r) == 'table' and r.ruleTag == RULE_TAG.ru then anchor = #kept end
+        end
+    end
+    if not anchor then
+        error('нет правила ' .. RULE_TAG.ru .. ' — некуда поставить bee-список', 0)
+    end
+    local ins = {}
+    if #new.domain > 0 then
+        ins[#ins + 1] = { type = 'field', domain = new.domain, outboundTag = BEE_OUT, ruleTag = BEE_TAG }
+    end
+    if #new.ip > 0 then
+        ins[#ins + 1] = { type = 'field', ip = new.ip, outboundTag = BEE_OUT, ruleTag = BEE_IP_TAG }
+    end
+    for i = #ins, 1, -1 do table.insert(kept, anchor, ins[i]) end
+    cfg.routing.rules = kept
+    return 'ok', added
+end
+
 -- Сколько доменов лейна перекрыто правилом, стоящим ВЫШЕ (first-match-wins).
 local function count_shadowed(cfg, found, lane)
     local target = found[lane]
@@ -613,7 +739,7 @@ local function count_shadowed(cfg, found, lane)
     local n = 0
     for _, r in ipairs(cfg.routing.rules) do
         if r == target then break end
-        if type(r) == 'table' and type(r.domain) == 'table' then
+        if type(r) == 'table' and type(r.domain) == 'table' and r.ruleTag ~= BEE_TAG then
             for _, d in ipairs(r.domain) do if mine[d] then n = n + 1 end end
         end
     end
@@ -621,8 +747,10 @@ local function count_shadowed(cfg, found, lane)
 end
 
 -- Применить списки к одному файлу. mode: 'merge' | 'replace'.
+-- lists.bee (если не nil) — { domain = {...}, ip = {...} } для лейна bee.
 -- Возвращает: status ('ok'|'nochange'|'nolist'|'broken'|'fail'),
---             добавлено, перенесено из legacy, перекрыто сверху, вывод xray
+--             добавлено, перенесено из legacy, перекрыто сверху, вывод xray,
+--             статус bee ('skip'|'nochange'|'ok'|nil)
 local function write_lists(path, lists, mode, bakdir)
     local ok_read, cfg = pcall(read_json, path)
     if not ok_read then return 'fail', 0, 0, 0, tostring(cfg) end
@@ -666,11 +794,19 @@ local function write_lists(path, lists, mode, bakdir)
         end
     end
 
+    local bee_st = nil
+    if lists.bee then
+        local okb, st, add = pcall(apply_bee, cfg, lists.bee, mode)
+        if not okb then return 'fail', 0, 0, 0, tostring(st) end
+        bee_st = st
+        if st == 'ok' then changed = true; added = added + add end
+    end
+
     for _, lane in ipairs(LANES) do
         shadowed = shadowed + count_shadowed(cfg, found, lane)
     end
 
-    if not changed then return 'nochange', 0, 0, shadowed, '' end
+    if not changed then return 'nochange', 0, 0, shadowed, '', bee_st end
 
     local tmp = CONFIG_DIR .. '/.config-validate.json'
     local f, ferr = io.open(tmp, 'w')
@@ -682,7 +818,7 @@ local function write_lists(path, lists, mode, bakdir)
         -- был ли файл валиден ДО нас? если нет — это не наша поломка
         local was_ok = xray_validate(path)
         os.remove(tmp)
-        return (was_ok and 'fail' or 'broken'), 0, 0, 0, out
+        return (was_ok and 'fail' or 'broken'), 0, 0, 0, out, bee_st
     end
 
     if path == CONFIG_FILE then
@@ -691,7 +827,7 @@ local function write_lists(path, lists, mode, bakdir)
         os.execute('mkdir -p ' .. bakdir .. ' && cp ' .. path .. ' ' .. bakdir .. '/ 2>/dev/null')
     end
     os.rename(tmp, path)
-    return 'ok', added, moved, shadowed, ''
+    return 'ok', added, moved, shadowed, '', bee_st
 end
 
 -- Раскатать списки по выбранным целям. targets: {config=bool, templates=bool}
@@ -710,12 +846,15 @@ local function apply_lists(lists, mode, targets)
     local bakdir = CONFIG_DIR .. '/backups/' .. os.date('%Y%m%d_%H%M%S') .. '-lists'
 
     local rep = { ok = {}, nochange = {}, nolist = {}, broken = {}, fail = {},
-                  bakdir = bakdir, added = 0, moved = 0, shadowed = 0, restarted = nil }
+                  bakdir = bakdir, added = 0, moved = 0, shadowed = 0, restarted = nil,
+                  bee_in = 0, bee_skip = 0 }
     local config_changed = false
 
     for _, path in ipairs(files) do
         local name = path:match('([^/]+)$')
-        local st, added, moved, shadowed, out = write_lists(path, lists, mode, bakdir)
+        local st, added, moved, shadowed, out, bee_st = write_lists(path, lists, mode, bakdir)
+        if bee_st == 'skip' then rep.bee_skip = rep.bee_skip + 1
+        elseif bee_st and (st == 'ok' or st == 'nochange') then rep.bee_in = rep.bee_in + 1 end
         rep.added    = rep.added + added
         rep.moved    = rep.moved + moved
         rep.shadowed = rep.shadowed + shadowed
@@ -1051,6 +1190,29 @@ local function render(message, sel_tpl, vless_pre, sel_bak, sel_restore)
             end
         end
     end
+    local bee_html = ''
+    if ok and has_outbound(cfg, BEE_OUT) then
+        local b = get_bee(cfg)
+        local all = {}
+        for _, d in ipairs(b.domain) do all[#all + 1] = d end
+        for _, d in ipairs(b.ip) do all[#all + 1] = d end
+        local via = ''
+        for _, ob in ipairs(cfg.outbounds) do
+            if type(ob) == 'table' and ob.tag == BEE_OUT then
+                local v  = (((ob.settings or {}).vnext or {})[1]) or {}
+                local dp = ((ob.streamSettings or {}).sockopt or {}).dialerProxy
+                via = tostring(v.address or '?') .. (dp and (' через ' .. tostring(dp)) or '')
+            end
+        end
+        bee_html = string.format([[
+    <div style="margin-top:12px">
+      <div class="lbl">Через домашний IP (bee) <span class="bak">(%d доменов, %d IP · → <code>%s</code> %s · приоритет выше российского)</span></div>
+      <textarea name="list_bee" rows="5" placeholder="ozon.ru&#10;185.73.192.0/22">%s</textarea>
+      <div class="bak" style="margin-top:4px">Домены и IP вперемешку: <code>1.2.3.4</code>, <code>10.0.0.0/8</code>,
+      <code>2a00::/32</code>, <code>geoip:xx</code> уйдут в правило <code>bee-list-ip</code>, остальное — в <code>bee-list</code>.
+      Применяется только к конфигам и шаблонам, где есть <code>proxy-res</code>.</div>
+    </div>]], #b.domain, #b.ip, BEE_OUT, html(via), html(table.concat(all, '\n')))
+    end
     local n_tpl = #list_templates()
     local lists_html = string.format([[
 <div class="card">
@@ -1064,7 +1226,7 @@ local function render(message, sel_tpl, vless_pre, sel_bak, sel_restore)
     <div style="margin-top:12px">
       <div class="lbl">Российские ресурсы <span class="bak">(%s доменов · в этом конфиге → <code>%s</code>)</span></div>
       <textarea name="list_ru" rows="7" placeholder="vkvideo.ru">%s</textarea>
-    </div>
+    </div>%s
     <div style="margin-top:14px;display:flex;gap:18px;flex-wrap:wrap">
       <label><input type="radio" name="mode" value="merge" checked> добавить</label>
       <label><input type="radio" name="mode" value="replace"> заменить целиком</label>
@@ -1083,7 +1245,7 @@ local function render(message, sel_tpl, vless_pre, sel_bak, sel_restore)
 </div>]],
         #lst.foreign, html(lane_to.foreign), html(table.concat(lst.foreign, '\n')),
         #lst.ru,      html(lane_to.ru),      html(table.concat(lst.ru,      '\n')),
-        n_tpl)
+        bee_html, n_tpl)
 
     -- Geo-файлы: строка на каждый файл (имя · размер · кнопка)
     local gdir = asset_dir()
@@ -1413,6 +1575,16 @@ if method == 'POST' then
                         error('Домен и в заграничном, и в российском списке: ' .. d, 0)
                     end
                 end
+                -- поле list_bee есть только в форме с proxy-res; нет поля — bee не трогаем
+                if data.list_bee ~= nil then
+                    lists.bee = parse_bee(data.list_bee)
+                    for _, d in ipairs(lists.bee.domain) do
+                        if seen[d] then
+                            error('Домен и в заграничном, и в bee-списке: ' .. d
+                                .. ' (заграничный стоит выше — bee не сработает)', 0)
+                        end
+                    end
+                end
                 -- «Заменить целиком» правит СУЩЕСТВУЮЩИЙ большой список конфига,
                 -- поэтому частичный список стёр бы его. Требуем якорные домены.
                 if mode == 'replace' then
@@ -1440,6 +1612,10 @@ if method == 'POST' then
                         mode, #rep.ok, #rep.nochange, rep.added, rep.moved, rep.shadowed,
                         #rep.nolist, #rep.broken, #rep.fail))
                     if #rep.ok > 0 then io.write('changed: ' .. table.concat(rep.ok, ' ') .. '\n') end
+                    if data.list_bee ~= nil then
+                        io.write(string.format('bee: files=%d skipped_no_proxy_res=%d\n',
+                            rep.bee_in, rep.bee_skip))
+                    end
                     if #rep.nolist > 0 then
                         io.write('nolist (не опознаны списки, пропущены): '
                             .. table.concat(rep.nolist, ' ') .. '\n')
@@ -1468,6 +1644,11 @@ if method == 'POST' then
                     if #rep.nolist > 0 then
                         bits[#bits+1] = 'Пропущены (нет опознаваемых списков): <b>'
                             .. html(table.concat(rep.nolist, ', ')) .. '</b>'
+                    end
+                    if data.list_bee ~= nil then
+                        bits[#bits+1] = string.format(
+                            'bee-список: в %d файлах с <code>proxy-res</code> · пропущено без него: %d',
+                            rep.bee_in, rep.bee_skip)
                     end
                     if rep.shadowed > 0 then
                         bits[#bits+1] = string.format(

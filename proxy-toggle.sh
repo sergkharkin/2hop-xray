@@ -13,6 +13,11 @@ teardown_redirect() {
     iptables -t nat -F XRAY 2>/dev/null
     iptables -t nat -X XRAY 2>/dev/null
     iptables -D FORWARD -i br-lan -p udp --dport 443 -j REJECT 2>/dev/null
+    iptables -t mangle -D PREROUTING -i br-lan -p udp -j XRAY_UDP 2>/dev/null
+    iptables -t mangle -F XRAY_UDP 2>/dev/null
+    iptables -t mangle -X XRAY_UDP 2>/dev/null
+    ip rule del fwmark 1 lookup 100 2>/dev/null
+    ip route flush table 100 2>/dev/null
 }
 
 case "$1" in

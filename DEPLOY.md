@@ -139,8 +139,11 @@ ssh glinet "/etc/init.d/xray restart"
 Кнопки вызывают `proxy-toggle.sh {on|off}`:
 
 - **off** — `xray stop`, отключение автозапуска (`uci xray.enabled.enabled='0'` +
-  `/etc/init.d/xray disable`), снос NAT-правил прозрачного прокси, установка флага
-  `/etc/xray/disabled`. Роутер работает обычным шлюзом.
+  `/etc/init.d/xray disable`), снос правил прозрачного прокси (nat `XRAY`,
+  REJECT для QUIC, mangle `XRAY_UDP` с TPROXY, `ip rule fwmark 1` и таблица
+  маршрутов 100), установка флага `/etc/xray/disabled`. Роутер работает обычным
+  шлюзом — в том числе для UDP (звонки, WebRTC), который иначе продолжал бы
+  уходить на остановленный порт TPROXY.
 - **on** — снятие флага, включение автозапуска, `xray start`, повторный прогон
   `transparent-proxy.sh`.
 
